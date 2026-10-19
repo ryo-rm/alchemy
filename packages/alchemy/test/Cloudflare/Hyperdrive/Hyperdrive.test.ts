@@ -99,21 +99,26 @@ test.provider(
         }),
       );
 
-      const updated = yield* stack.deploy(
-        Effect.gen(function* () {
-          const project = yield* Neon.Project("CRUDProject");
-          return yield* Cloudflare.Hyperdrive.Connection("CRUDHyperdrive", {
-            origin: project.origin,
-            caching: { disabled: true },
-          });
-        }),
-      );
+      const updateConnection = Effect.gen(function* () {
+        const project = yield* Neon.Project("CRUDProject");
+        return yield* Cloudflare.Hyperdrive.Connection("CRUDHyperdrive", {
+          origin: project.origin,
+          caching: { disabled: true },
+        });
+      });
+      const updated = yield* stack.deploy(updateConnection);
 
       expect(updated.hyperdriveId).toEqual(hd.hyperdriveId);
 
       const actual = yield* hyperdrive.getConfig({ accountId, hyperdriveId: updated.hyperdriveId });
       // After PUT with `disabled: true`, caching should reflect the change.
       expect(actual.caching).toBeDefined();
+
+      // A forced redeploy of identical props must not call updateConfig
+      // (each call opens a new origin pool).
+      yield* stack.deploy(updateConnection, { force: true });
+      const forced = yield* hyperdrive.getConfig({ accountId, hyperdriveId: updated.hyperdriveId });
+      expect(forced.modifiedOn).toEqual(actual.modifiedOn);
 
       yield* stack.destroy();
 
