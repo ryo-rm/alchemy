@@ -314,7 +314,7 @@ export const ProviderLive = () =>
       }
       return undefined;
     }),
-    reconcile: Effect.fn(function* ({ id, news, output }) {
+    reconcile: Effect.fn(function* ({ id, news, olds, output }) {
       const { accountId } = yield* yield* CloudflareEnvironment;
       const name = output?.name ?? (yield* createConfigName(id, news.name));
 
@@ -325,45 +325,61 @@ export const ProviderLive = () =>
         originConnectionLimit: news.originConnectionLimit,
       };
 
-      // Observe + ensure. When we know the hyperdriveId we go straight
-      // to update; otherwise we createConfig and fall back to "find by
-      // name then update" if Cloudflare reports the name is already in
-      // use (race or a cold-start adoption).
-      const synced = yield* (
-        output?.hyperdriveId
-          ? hyperdrive.updateConfig({
-              accountId: output.accountId,
-              hyperdriveId: output.hyperdriveId,
-              name: output.name,
-              ...requestBody,
-            })
-          : hyperdrive.createConfig({ accountId, name, ...requestBody }).pipe(
-              Effect.catchTag("InvalidHyperdriveConfig", (originalError) =>
-                Effect.gen(function* () {
-                  const match = yield* findByName(name);
-                  if (!match) {
-                    return yield* originalError;
-                  }
-                  return yield* hyperdrive.updateConfig({
-                    accountId,
-                    hyperdriveId: match.id,
-                    name,
-                    ...requestBody,
-                  });
-                }),
-              ),
-            )
-      ).pipe(
-        // Cloudflare connects to the origin on create/update. A just-
-        // provisioned database, or a just-created Workers VPC Service that
-        // has not propagated yet (`destination_not_found`), is briefly
-        // unreachable.
-        Effect.retry({
-          while: (error) => error._tag === "HyperdriveOriginUnavailable",
-          schedule: Schedule.spaced("3 seconds"),
-          times: 20,
-        }),
-      );
+      // Observe. `output` is only a cache of the id; a deleted config
+      // falls through to create.
+      const observed = output?.hyperdriveId
+        ? yield* hyperdrive
+            .getConfig({ accountId: output.accountId, hyperdriveId: output.hyperdriveId })
+            .pipe(Effect.catchTag("HyperdriveConfigNotFound", () => Effect.succeed(undefined)))
+        : undefined;
+
+      // Cloudflare connects to the origin on create/update. A just-
+      // provisioned database, or a just-created Workers VPC Service that
+      // has not propagated yet (`destination_not_found`), is briefly
+      // unreachable.
+      const retryOriginUnavailable = <A, E extends { _tag: string }, R>(
+        self: Effect.Effect<A, E, R>,
+      ) =>
+        self.pipe(
+          Effect.retry({
+            while: (error) => error._tag === "HyperdriveOriginUnavailable",
+            schedule: Schedule.spaced("3 seconds"),
+            times: 20,
+          }),
+        );
+
+      // Ensure + sync. Every updateConfig opens a new origin pool at
+      // Cloudflare, so only call it on drift. A missing config is created,
+      // falling back to "find by name then update" if Cloudflare reports
+      // the name is already in use (race or a cold-start adoption).
+      const synced = !observed
+        ? yield* hyperdrive.createConfig({ accountId, name, ...requestBody }).pipe(
+            Effect.catchTag("InvalidHyperdriveConfig", (originalError) =>
+              Effect.gen(function* () {
+                const match = yield* findByName(name);
+                if (!match) {
+                  return yield* originalError;
+                }
+                return yield* hyperdrive.updateConfig({
+                  accountId,
+                  hyperdriveId: match.id,
+                  name,
+                  ...requestBody,
+                });
+              }),
+            ),
+            retryOriginUnavailable,
+          )
+        : hasDrift(observed, news, olds)
+          ? yield* hyperdrive
+              .updateConfig({
+                accountId: output!.accountId,
+                hyperdriveId: observed.id,
+                name: observed.name,
+                ...requestBody,
+              })
+              .pipe(retryOriginUnavailable)
+          : observed;
 
       return {
         hyperdriveId: synced.id,
@@ -487,4 +503,40 @@ const toRequestOrigin = (origin: Origin) => {
     scheme: origin.scheme,
     user: origin.user,
   };
+};
+
+/**
+ * A set desired field differs from the live one, or a previously set field was
+ * dropped. Fields omitted from the start accept live (Cloudflare defaults).
+ */
+const fieldsDiffer = (want: object | undefined, live: object | null | undefined, prev?: object) => {
+  const w = new Map(Object.entries(want ?? {}));
+  const l = new Map(Object.entries(live ?? {}));
+  const p = new Map(Object.entries(prev ?? {}));
+  return [...new Set([...w.keys(), ...p.keys()])].some((k) =>
+    w.get(k) !== undefined ? w.get(k) !== l.get(k) : p.get(k) !== undefined,
+  );
+};
+
+/**
+ * Whether the live config differs from the desired props. Secrets are
+ * write-only, so they are compared against the previous props instead; with no
+ * previous props (adoption) we cannot tell and send once.
+ */
+const hasDrift = (observed: hyperdrive.GetConfigResponse, news: Props, olds: Props | undefined) => {
+  if (!olds) return true;
+  const { password, accessClientSecret, ...visible } = toRequestOrigin(news.origin) as Record<
+    string,
+    unknown
+  >;
+  const old = toRequestOrigin(olds.origin) as Record<string, unknown>;
+  return (
+    fieldsDiffer(visible, observed.origin) ||
+    password !== old.password ||
+    accessClientSecret !== old.accessClientSecret ||
+    fieldsDiffer(news.caching, observed.caching, olds.caching) ||
+    fieldsDiffer(news.mtls, observed.mtls, olds.mtls) ||
+    ((news.originConnectionLimit ?? olds.originConnectionLimit) !== undefined &&
+      news.originConnectionLimit !== observed.originConnectionLimit)
+  );
 };
